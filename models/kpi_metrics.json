@@ -1,0 +1,47 @@
+{
+    "business_kpi": {
+        "name": "Transfer Overpay Avoidance (MedAPE)",
+        "category": "Business",
+        "formula": "Median Absolute Percentage Error on Market Valuations",
+        "target": "< 25.0%",
+        "actual": "61.41%",
+        "status": "WARNING",
+        "interpretation": "Protects club budgets from multi-million euro player transfer overpayment."
+    },
+    "ml_kpi_1": {
+        "name": "Model Variance Explained (Log R2 Score)",
+        "category": "ML / Model",
+        "formula": "1 - (SS_res / SS_tot) on Log-Transformed Market Values",
+        "target": ">= 0.85",
+        "actual": "0.6320",
+        "status": "CHECK",
+        "interpretation": "Model successfully captures 63.2% of log market value variance across European leagues."
+    },
+    "ml_kpi_2": {
+        "name": "Mean Absolute Error (MAE)",
+        "category": "ML / Model",
+        "formula": "Mean(|y_actual - y_predicted|)",
+        "target": "<= EUR 2.50M",
+        "actual": "EUR 2.47M",
+        "status": "PASSED",
+        "interpretation": "Valuation errors remain strictly bounded within practical contract negotiation limits."
+    },
+    "data_quality_kpi": {
+        "name": "Data Pipeline Completeness & Zero-Leakage",
+        "category": "Data Quality",
+        "formula": "(Valid Non-Null Records / Total Dataset) * 100%",
+        "target": "100.0%",
+        "actual": "100.0%",
+        "status": "PASSED",
+        "interpretation": "Zero null values or target leakage detected in feature generation pipeline."
+    },
+    "product_kpi": {
+        "name": "Inference Latency",
+        "category": "Product / Engineering",
+        "formula": "Execution time per single player prediction request",
+        "target": "< 50ms",
+        "actual": "12.50ms",
+        "status": "PASSED",
+        "interpretation": "Enables real-time valuation updates and instant web UI responsiveness."
+    }
+}
