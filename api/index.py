@@ -1,9 +1,6 @@
 import os
 import json
 import time
-import numpy as np
-import pandas as pd
-import joblib
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -11,7 +8,6 @@ app = Flask(__name__)
 # Base directory setup
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, 'models')
-DATA_DIR = os.path.join(BASE_DIR, 'data')
 
 # Top European Elite Clubs
 TOP_CLUBS = {
@@ -21,53 +17,84 @@ TOP_CLUBS = {
     'ac milan', 'atletico madrid', 'tottenham hotspur', 'borussia dortmund', 'napoli'
 }
 
-# --- Lazy Artifact Loaders ---
-_model = None
-_scaler = None
+# Lazy JSON Artifact Loaders
+_lgbm_json = None
+_scaler_dict = None
 _feature_cols = None
-_players_df = None
+_players_data = None
 _kpis_data = None
-_comparison_df = None
+_comparison_data = None
 
-def get_artifacts():
-    global _model, _scaler, _feature_cols
-    if _model is None:
-        model_path = os.path.join(MODEL_DIR, 'best_model.pkl')
-        scaler_path = os.path.join(MODEL_DIR, 'feature_scaler.pkl')
+def get_json_model():
+    global _lgbm_json, _scaler_dict, _feature_cols
+    if _lgbm_json is None:
+        model_path = os.path.join(MODEL_DIR, 'lightgbm_model.json')
+        scaler_path = os.path.join(MODEL_DIR, 'scaler_params.json')
         cols_path = os.path.join(MODEL_DIR, 'feature_columns.json')
-        
-        if os.path.exists(model_path):
-            _model = joblib.load(model_path)
-            _scaler = joblib.load(scaler_path)
-            _feature_cols = joblib.load(cols_path)
-    return _model, _scaler, _feature_cols
 
-def get_players_df():
-    global _players_df
-    if _players_df is None:
-        csv_path = os.path.join(DATA_DIR, 'processed_players.csv')
-        if not os.path.exists(csv_path):
-            csv_path = os.path.join(BASE_DIR, 'final_data.csv')
-        if os.path.exists(csv_path):
-            _players_df = pd.read_csv(csv_path)
-    return _players_df
+        if os.path.exists(model_path):
+            with open(model_path, 'r') as f:
+                _lgbm_json = json.load(f)
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'r') as f:
+                _scaler_dict = json.load(f)
+        if os.path.exists(cols_path):
+            with open(cols_path, 'r') as f:
+                _feature_cols = json.load(f)
+    return _lgbm_json, _scaler_dict, _feature_cols
+
+def get_players():
+    global _players_data
+    if _players_data is None:
+        p_path = os.path.join(MODEL_DIR, 'players_slim.json')
+        if os.path.exists(p_path):
+            with open(p_path, 'r') as f:
+                _players_data = json.load(f)
+    return _players_data or []
 
 def get_kpis():
     global _kpis_data
     if _kpis_data is None:
-        kpi_path = os.path.join(MODEL_DIR, 'kpi_metrics.json')
-        if os.path.exists(kpi_path):
-            with open(kpi_path, 'r') as f:
+        k_path = os.path.join(MODEL_DIR, 'kpi_metrics.json')
+        if os.path.exists(k_path):
+            with open(k_path, 'r') as f:
                 _kpis_data = json.load(f)
-    return _kpis_data
+    return _kpis_data or {}
 
-def get_comparison():
-    global _comparison_df
-    if _comparison_df is None:
-        comp_path = os.path.join(MODEL_DIR, 'model_comparison.csv')
-        if os.path.exists(comp_path):
-            _comparison_df = pd.read_csv(comp_path)
-    return _comparison_df
+def get_benchmarks():
+    global _comparison_data
+    if _comparison_data is None:
+        c_path = os.path.join(MODEL_DIR, 'model_comparison.csv')
+        if os.path.exists(c_path):
+            import csv
+            with open(c_path, 'r') as f:
+                reader = csv.DictReader(f)
+                _comparison_data = list(reader)
+    return _comparison_data or []
+
+# LightGBM Pure Python Decision Tree Evaluator
+def eval_node(node, features):
+    if 'leaf_value' in node:
+        return node['leaf_value']
+    feat_idx = node['split_feature']
+    threshold = node['threshold']
+    if features[feat_idx] <= threshold:
+        return eval_node(node['left_child'], features)
+    else:
+        return eval_node(node['right_child'], features)
+
+def predict_lgb_json(lgb_json, feature_vector):
+    raw_score = float(lgb_json.get('base_score', 0.0))
+    for tree in lgb_json.get('tree_info', []):
+        raw_score += float(eval_node(tree['tree_structure'], feature_vector))
+    return raw_score
+
+def scale_features(raw_vector, mean_vec, scale_vec):
+    scaled = []
+    for x, m, s in zip(raw_vector, mean_vec, scale_vec):
+        s_val = s if s != 0 else 1.0
+        scaled.append((x - m) / s_val)
+    return scaled
 
 def format_euro(amount):
     if amount >= 1_000_000:
@@ -82,10 +109,10 @@ def format_euro(amount):
 def predict():
     t0 = time.time()
     data = request.json or {}
-    
-    model, scaler, feature_cols = get_artifacts()
-    if model is None:
-        return jsonify({'error': 'Model artifacts not found. Please train model first.'}), 500
+
+    lgb_json, scaler_dict, feature_cols = get_json_model()
+    if lgb_json is None or scaler_dict is None or feature_cols is None:
+        return jsonify({'error': 'Model JSON artifacts missing.'}), 500
 
     age = float(data.get('age', 24))
     height = float(data.get('height', 182))
@@ -147,12 +174,12 @@ def predict():
         'pos_Goalkeeper': pos_Goalkeeper, 'pos_Midfielder': pos_Midfielder
     }
 
-    row_vector = [feature_map.get(col, 0.0) for col in feature_cols]
-    X_input = pd.DataFrame([row_vector], columns=feature_cols)
+    raw_vector = [feature_map.get(col, 0.0) for col in feature_cols]
+    scaled_vector = scale_features(raw_vector, scaler_dict['mean'], scaler_dict['scale'])
 
-    X_scaled = scaler.transform(X_input)
-    pred_log = float(model.predict(X_scaled)[0])
-    pred_raw = max(float(np.expm1(pred_log)), 100_000.0)
+    pred_log = predict_lgb_json(lgb_json, scaled_vector)
+    import math
+    pred_raw = max(math.expm1(pred_log), 100_000.0)
 
     latency_ms = (time.time() - t0) * 1000.0
 
@@ -171,35 +198,21 @@ def predict():
     })
 
 @app.route('/api/players', methods=['GET'])
-def get_players():
-    df = get_players_df()
-    if df is None:
-        return jsonify([])
-    
+def get_players_endpoint():
+    players = get_players()
     query = request.args.get('search', '').lower()
-    pos = request.args.get('position', 'All')
-    min_val = float(request.args.get('min_val', 0))
-
-    filtered = df.copy()
     if query:
-        filtered = filtered[filtered['name'].astype(str).str.lower().str.contains(query)]
-    if pos != 'All':
-        filtered = filtered[filtered['position'] == pos]
-    filtered = filtered[filtered['current_value'] >= min_val]
-
-    records = filtered.head(50).to_dict(orient='records')
-    return jsonify(records)
+        players = [p for p in players if query in str(p.get('name', '')).lower()]
+    return jsonify(players[:50])
 
 @app.route('/api/kpis', methods=['GET'])
 def get_kpis_endpoint():
-    return jsonify(get_kpis() or {})
+    return jsonify(get_kpis())
 
 @app.route('/api/benchmarks', methods=['GET'])
 def get_benchmarks_endpoint():
-    df = get_comparison()
-    return jsonify(df.to_dict(orient='records') if df is not None else [])
+    return jsonify(get_benchmarks())
 
-# --- Cyber-Sports Dark Mode Web Interface ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -230,7 +243,6 @@ HTML_TEMPLATE = """
 
         .container { max-width: 1200px; margin: 0 auto; }
 
-        /* Hero Container */
         .hero {
             background: linear-gradient(135deg, rgba(17, 24, 39, 0.9) 0%, rgba(15, 23, 42, 0.95) 100%);
             border: 1px solid rgba(255, 255, 255, 0.08);
@@ -262,7 +274,6 @@ HTML_TEMPLATE = """
 
         .subtitle { color: var(--text-dim); margin-top: 0.5rem; font-size: 1rem; }
 
-        /* Navigation Tabs */
         .tabs { display: flex; gap: 10px; margin-bottom: 1.5rem; }
         .tab-btn {
             background: rgba(17, 24, 39, 0.6);
@@ -280,7 +291,6 @@ HTML_TEMPLATE = """
             color: var(--text-light);
         }
 
-        /* Glassmorphism Cards */
         .glass-card {
             background: var(--card-bg);
             border: 1px solid rgba(255, 255, 255, 0.08);
@@ -319,7 +329,6 @@ HTML_TEMPLATE = """
         }
         .btn-submit:hover { transform: translateY(-2px); box-shadow: 0 15px 30px -5px rgba(16, 185, 129, 0.6); }
 
-        /* Custom Metrics */
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-top: 1.5rem; }
         .metric-card {
             background: rgba(15, 23, 42, 0.9);
@@ -339,17 +348,15 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <!-- Hero Header -->
         <div class="hero">
             <div class="badges">
-                <span class="badge">VERCEL SERVERLESS DEPLOYED</span>
+                <span class="badge">VERCEL ULTRA-SLIM ENGINE</span>
                 <span class="badge">AI POWERED V2.0</span>
             </div>
             <h1 class="title">Football Player Market Value AI</h1>
             <p class="subtitle">Data-Driven Machine Learning Appraisal System for Transfer Scouting & Financial Evaluation.</p>
         </div>
 
-        <!-- Tab Buttons -->
         <div class="tabs">
             <button class="tab-btn active" onclick="showTab('tab-calc', this)">🎯 Live Calculator</button>
             <button class="tab-btn" onclick="showTab('tab-explorer', this)">🔍 Squad Explorer</button>
@@ -357,7 +364,6 @@ HTML_TEMPLATE = """
             <button class="tab-btn" onclick="showTab('tab-kpis', this)">📈 KPI Scorecard</button>
         </div>
 
-        <!-- TAB 1: Live Calculator -->
         <div id="tab-calc" class="tab-content">
             <div class="glass-card">
                 <h3 style="margin-bottom: 1rem; color: var(--emerald);">🎯 Real-Time Player Market Value Valuation Engine</h3>
@@ -441,7 +447,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 2: Explorer -->
         <div id="tab-explorer" class="tab-content hidden">
             <div class="glass-card">
                 <h3>🔍 Player Database Explorer</h3>
@@ -457,7 +462,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 3: Benchmarks -->
         <div id="tab-benchmarks" class="tab-content hidden">
             <div class="glass-card">
                 <h3>🤖 Machine Learning Model Benchmarks</h3>
@@ -472,7 +476,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TAB 4: KPIs -->
         <div id="tab-kpis" class="tab-content hidden">
             <div class="glass-card">
                 <h3>📈 Executive KPI Scorecard</h3>
@@ -587,6 +590,5 @@ HTML_TEMPLATE = """
 def home():
     return render_template_string(HTML_TEMPLATE)
 
-# Standard Flask runner for local debugging
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
